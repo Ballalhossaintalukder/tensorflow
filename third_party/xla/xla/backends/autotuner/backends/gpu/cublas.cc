@@ -19,17 +19,16 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "absl/algorithm/container.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/codegen_backend.h"
-#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
-#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/service/compiler.h"
+#include "xla/service/gpu/autotuning/redzone_buffers.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/gpu/cublas_cudnn.h"
 #include "xla/service/gpu/matmul_utils.h"
@@ -45,7 +44,6 @@ limitations under the License.
 #include "xla/stream_executor/device_memory_allocator.h"
 #include "xla/stream_executor/stream_executor.h"
 #include "xla/stream_executor/stream_executor_memory_allocator.h"
-#include "xla/tools/hlo_decomposer.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 
@@ -56,85 +54,53 @@ namespace se = ::stream_executor;
 
 using CublasBackendConfig = AutotuneResult::GemmKey;
 
-absl::StatusOr<const HloInstruction*> GetGemmInstruction(
-    const HloInstruction* instr) {
-  // Is dot instruction.
-  if (instr->opcode() == HloOpcode::kDot) {
-    return instr;
-  }
-
-  // Is Cublas custom call instruction.
-  if (IsLegacyCublasMatmul(*instr)) {
-    return instr;
-  }
-
-  // Is fusion instruction containing a GEMM instruction.
-  if (instr->opcode() == HloOpcode::kFusion) {
-    auto fused_instructions = instr->fused_instructions();
-    auto gemm_instr_it =
-        absl::c_find_if(fused_instructions, HloPredicateIsOp<HloOpcode::kDot>);
-    if (gemm_instr_it != std::end(fused_instructions)) {
-      return *gemm_instr_it;
-    }
-  }
-
-  return absl::InvalidArgumentError(
-      "CublasBackend didn't find a compatible Cublas GEMM.");
-}
-
 absl::StatusOr<std::vector<std::unique_ptr<BackendConfig>>>
 CublasBackend::GetSupportedConfigs(
     const HloInstruction& instr,
     stream_executor::StreamExecutor* stream_executor) {
-  TF_ASSIGN_OR_RETURN(const HloInstruction* gemm_instr,
-                      GetGemmInstruction(&instr));
+  if (!IsLegacyCublasMatmul(instr)) {
+    return absl::InvalidArgumentError(
+        "CublasBackend does not support this instruction.");
+  }
+
   std::unique_ptr<se::DeviceMemoryAllocator> allocator =
       std::make_unique<se::StreamExecutorMemoryAllocator>(stream_executor);
-  TF_ASSIGN_OR_RETURN(absl::StatusOr<se::Stream*> stream,
+  TF_ASSIGN_OR_RETURN(se::Stream * stream,
                       allocator->GetStream(stream_executor->device_ordinal()));
 
   // We use GemmConfig::For with GemmBackendConfig as a fallback because
   // Matmul_utils.cc relies on backend config to determine gemm contracting
   // dimensions.
   GemmBackendConfig backend_config;
-  // For custom call, we use the backend config from the custom call.
-  if (gemm_instr->opcode() == HloOpcode::kCustomCall) {
-    backend_config =
-        gemm_instr->backend_config<GpuBackendConfig>()->gemm_backend_config();
-  } else {
-    *backend_config.mutable_dot_dimension_numbers() =
-        gemm_instr->dot_dimension_numbers();
-  }
+  backend_config =
+      instr.backend_config<GpuBackendConfig>()->gemm_backend_config();
   TF_ASSIGN_OR_RETURN(
       GemmConfig gemm_config,
       GemmConfig::For(
-          gemm_instr, backend_config,
+          &instr, backend_config,
           target_config().device_description.gpu_compute_capability()));
 
-  // Get dummy buffers for the GEMM instruction.
-  const HloInstruction* lhs_operand = gemm_instr->operand(0);
-  se::DeviceMemoryBase lhs_buffer = se::DeviceMemoryBase(
-      nullptr, xla::ShapeUtil::ByteSizeOf(lhs_operand->shape()));
-  const HloInstruction* rhs_operand = gemm_instr->operand(1);
-  se::DeviceMemoryBase rhs_buffer = se::DeviceMemoryBase(
-      nullptr, xla::ShapeUtil::ByteSizeOf(rhs_operand->shape()));
-  // For custom call, the output buffer is the first tuple element.
-  const Shape& output_shape = gemm_instr->opcode() == HloOpcode::kCustomCall
-                                  ? gemm_instr->shape().tuple_shapes(0)
-                                  : gemm_instr->shape();
-  se::DeviceMemoryBase output_buffer =
-      se::DeviceMemoryBase(nullptr, xla::ShapeUtil::ByteSizeOf(output_shape));
+  TF_ASSIGN_OR_RETURN(RedzoneBuffers rz_buffers,
+                      RedzoneBuffers::FromInstruction(
+                          instr, allocator.get(), stream,
+                          RedzoneBuffers::kAllInputsAllOutputs, true, true,
+                          instr.GetModule()
+                              ->config()
+                              .debug_options()
+                              .xla_gpu_redzone_padding_bytes()));
 
   TF_ASSIGN_OR_RETURN(
       GemmConfig::DescriptorsTuple desc,
-      gemm_config.GetMatrixDescriptors(lhs_buffer, rhs_buffer, output_buffer));
+      gemm_config.GetMatrixDescriptors(rz_buffers.input_buffers().at(0),
+                                       rz_buffers.input_buffers().at(1),
+                                       rz_buffers.output_buffers().at(0)));
 
   se::blas::BlasSupport* blas = stream_executor->AsBlas();
   if (blas == nullptr) {
     return absl::InternalError("Failed to getBlas support.");
   }
   std::vector<se::blas::AlgorithmType> algorithms;
-  blas->GetBlasGemmAlgorithms(*stream, desc.lhs, desc.rhs, &desc.output,
+  blas->GetBlasGemmAlgorithms(stream, desc.lhs, desc.rhs, &desc.output,
                               &gemm_config.alpha, &gemm_config.beta,
                               &algorithms);
 
@@ -200,7 +166,10 @@ void SubstituteCublasAlgorithms(const HloInstruction* gemm,
 
 absl::StatusOr<std::unique_ptr<BackendConfig>> CublasBackend::GetDefaultConfig(
     const HloInstruction& instr) {
-  TF_RETURN_IF_ERROR(GetGemmInstruction(&instr).status());
+  if (!IsLegacyCublasMatmul(instr)) {
+    return absl::InvalidArgumentError(
+        "CublasBackend does not support this instruction.");
+  }
 
   std::unique_ptr<CublasBackendConfig> gemm_key =
       std::make_unique<CublasBackendConfig>();
@@ -210,63 +179,13 @@ absl::StatusOr<std::unique_ptr<BackendConfig>> CublasBackend::GetDefaultConfig(
 
 absl::StatusOr<std::unique_ptr<HloModule>> CublasBackend::WrapInModule(
     const HloInstruction& hlo_instruction, const BackendConfig& config) {
-  const se::DeviceDescription& gpu_device_info =
-      target_config().device_description;
-  CublasBackendConfig cublas_config =
-      static_cast<const CublasBackendConfig&>(config);
-
-  // Handle dot instruction.
-  if (hlo_instruction.opcode() == HloOpcode::kDot) {
-    const HloComputation* computation = hlo_instruction.parent();
-    std::unique_ptr<HloModule> hlo_module =
-        ExtractComputationIntoNewModule(*computation);
-    TF_ASSIGN_OR_RETURN(
-        auto rewritten_module,
-        RewriteToCublasCustomCall(std::move(hlo_module), gpu_device_info));
-    SubstituteCublasAlgorithms(
-        rewritten_module->entry_computation()->root_instruction(),
-        cublas_config.algorithm());
-    return rewritten_module;
-  }
-
-  // Handle Cublas custom call instruction.
-  if (IsLegacyCublasMatmul(hlo_instruction)) {
-    const HloComputation* computation = hlo_instruction.parent();
-    std::unique_ptr<HloModule> hlo_module =
-        ExtractComputationIntoNewModule(*computation);
-    SubstituteCublasAlgorithms(
-        hlo_module->entry_computation()->root_instruction()->operand(0),
-        cublas_config.algorithm());
-    return hlo_module;
-  }
-
-  // Handle fusion instruction.
-  if (hlo_instruction.opcode() == HloOpcode::kFusion) {
-    const HloFusionInstruction* fusion_instruction =
-        Cast<HloFusionInstruction>(&hlo_instruction);
-    const HloComputation* fusion_computation =
-        fusion_instruction->called_computation();
-    std::unique_ptr<HloModule> hlo_module =
-        ExtractComputationIntoNewModule(*fusion_computation);
-    TF_ASSIGN_OR_RETURN(
-        std::unique_ptr<HloModule> rewritten_module,
-        RewriteToCublasCustomCall(std::move(hlo_module), gpu_device_info));
-    HloInstruction* dot = hlo_query::GetFirstInstructionWithOpcode(
-        *rewritten_module->entry_computation(), HloOpcode::kCustomCall);
-    SubstituteCublasAlgorithms(dot, cublas_config.algorithm());
-    return rewritten_module;
-  }
-
-  return absl::InvalidArgumentError(
-      "CublasBackend didn't find a compatible cuBLAS GEMM.");
+  return absl::UnimplementedError("Not implemented.");
 }
 
 absl::StatusOr<std::unique_ptr<HloModule>> CublasBackend::RunHloPasses(
     std::unique_ptr<HloModule> hlo_module,
     const Compiler::CompileOptions& options) {
-  // Noop;
-
-  return hlo_module;
+  return absl::UnimplementedError("Not implemented.");
 }
 
 }  // namespace gpu

@@ -526,9 +526,11 @@ xla_cc_test(
         ":hlo_module_config",
         "//xla:debug_options_flags",
         "//xla:xla_proto_cc",
+        "//xla/hlo/analysis:hlo_ordering",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/parser:hlo_parser",
         "//xla/runtime/large_hlo_snapshot_serialization:serialization",
+        "//xla/service:buffer_assignment",
         "//xla/tests:xla_internal_test_main",
         "//xla/tsl/lib/core:status_test_util",
         "//xla/tsl/platform:env",
@@ -1729,6 +1731,7 @@ xla_cc_test(
     srcs = ["buffer_assignment_test.cc"],
     deps = [
         ":buffer_assignment",
+        ":buffer_assignment_proto_cc",
         ":buffer_value",
         ":call_graph",
         ":copy_insertion",
@@ -3232,8 +3235,9 @@ xla_cc_test(
     deps = [
         ":cpu_plugin",
         ":hlo_cost_analysis",
-        ":local_service",
         ":service",
+        "//xla:array4d",
+        "//xla:literal_util",
         "//xla:shape_util",
         "//xla:xla_data_proto_cc",
         "//xla/client",
@@ -3247,8 +3251,13 @@ xla_cc_test(
         "//xla/hlo/testlib:hlo_hardware_independent_test_base",
         "//xla/hlo/testlib:test_helpers",
         "//xla/tests:xla_internal_test_main",
+        "//xla/tsl/platform:status",
+        "//xla/tsl/platform:statusor",
+        "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/status:statusor",
-        "@local_tsl//tsl/platform:logging",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
     ],
 )
 
@@ -4045,6 +4054,7 @@ cc_library(
         ":computation_layout",
         ":computation_placer",
         ":hlo_proto_cc",
+        ":schedule_config",
         ":sharding_config",
         "//xla:debug_options_flags",
         "//xla:shape_layout",
@@ -5755,6 +5765,7 @@ cc_library(
         "@local_tsl//tsl/platform:protobuf",
         "@local_tsl//tsl/platform:statusor",
     ],
+    alwayslink = 1,
 )
 
 xla_cc_test(
@@ -5929,6 +5940,25 @@ xla_cc_test(
 )
 
 cc_library(
+    name = "schedule_config",
+    srcs = ["schedule_config.cc"],
+    hdrs = ["schedule_config.h"],
+    deps = [
+        "//xla:xla_data_proto_cc",
+        "//xla:xla_proto_cc",
+    ],
+)
+
+xla_cc_test(
+    name = "schedule_config_test",
+    srcs = ["schedule_config_test.cc"],
+    deps = [
+        ":schedule_config",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "sharding_config",
     srcs = ["sharding_config.cc"],
     hdrs = ["sharding_config.h"],
@@ -5981,21 +6011,6 @@ xla_cc_test(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
         "@local_tsl//tsl/platform:statusor",
-    ],
-)
-
-cc_library(
-    name = "execution_graph_renderer",
-    srcs = ["execution_graph_renderer.cc"],
-    hdrs = ["execution_graph_renderer.h"],
-    deps = [
-        "//xla/backends/cpu/runtime:thunk",
-        "//xla/runtime:execution_graph",
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_absl//absl/synchronization",
     ],
 )
 

@@ -19,6 +19,8 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -155,6 +157,27 @@ class ExecutionGraph {
     int64_t priority = 0;
   };
 
+  class Renderer {
+   public:
+    Renderer() = default;
+    virtual ~Renderer() = default;
+
+    // Generates a string representation for the given execution graph
+    // operations which can be published to a URL using `PublishGraph`.
+    virtual std::string GenerateGraphAsString(
+        absl::Span<const ExecutionGraph::Operation* const> operations) = 0;
+
+    // Publishes the generated graph.
+    virtual absl::StatusOr<std::string> PublishGraph(
+        absl::string_view graph_as_string) = 0;
+  };
+
+  // Returns the registered renderer for execution graphs.
+  static Renderer* GetRenderer();
+
+  // Registers a renderer for execution graphs.
+  static void RegisterRenderer(std::unique_ptr<Renderer> renderer);
+
   // Constructs an execution graph from a sequence of operations.
   template <typename Op,
             std::enable_if_t<std::is_base_of_v<Operation, Op>>* = nullptr>
@@ -165,6 +188,10 @@ class ExecutionGraph {
     }
     return Create(ptrs);
   }
+
+  // Constructs an execution graph from a sequence of operations.
+  static absl::StatusOr<ExecutionGraph> Create(
+      absl::Span<const Operation* const> operations);
 
   // Returns execution graph nodes definitions.
   absl::Span<const NodeDef> nodes_defs() const { return nodes_defs_; }
@@ -206,10 +233,6 @@ class ExecutionGraph {
   bool is_sequential() const { return is_sequential_; }
 
  private:
-  // Constructs an execution graph from a sequence of operations.
-  static absl::StatusOr<ExecutionGraph> Create(
-      absl::Span<const Operation* const> operations);
-
   // We store all `in_edges` and `out_edges` referenced by the `NodeDef` inside
   // large vectors to optimize for data locality on a hot path.
   using NodesEdges = std::vector<NodeEdge>;

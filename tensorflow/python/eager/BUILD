@@ -321,6 +321,7 @@ cuda_py_strict_test(
     srcs = ["context_cross_platform_gpu_test.py"],
     tags = [
         "no_oss",
+        "noasan",  # TODO(b/417285186): Re-enable once the test is fixed.
     ],
     tpu_ops_enabled = True,
     xla_enabled = True,

@@ -223,7 +223,6 @@ cc_library(
         "//xla/hlo/testlib:test_helpers",
         "//xla/hlo/testlib:verified_hlo_module",
         "//xla/service:computation_placer_hdr",
-        "//xla/service:executable",
         "//xla/service:hlo_module_config",
         "//xla/service:hlo_module_util",
         "//xla/service:hlo_runner_interface",
@@ -467,7 +466,7 @@ cc_library(
     ],
 )
 
-xla_test(
+xla_cc_test(
     name = "bad_rng_shape_validation_test",
     srcs = ["bad_rng_shape_validation_test.cc"],
     tags = ["test_xla_cpu_no_thunks"],
@@ -611,7 +610,7 @@ xla_test(
     ],
 )
 
-xla_test(
+xla_cc_test(
     name = "query_inferred_shape_test",
     srcs = ["query_inferred_shape_test.cc"],
     tags = ["test_xla_cpu_no_thunks"],

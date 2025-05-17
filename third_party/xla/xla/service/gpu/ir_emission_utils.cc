@@ -40,13 +40,10 @@ limitations under the License.
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Intrinsics.h"
-#include "llvm/IR/IntrinsicsNVPTX.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/Verifier.h"
-#include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/TargetParser/Triple.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -63,13 +60,11 @@ limitations under the License.
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
-#include "xla/stream_executor/device_description.h"
 #include "xla/tsl/lib/strings/proto_serialization.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/protobuf.h"
-#include "tsl/platform/statusor.h"
 
 namespace xla {
 namespace gpu {
@@ -448,36 +443,33 @@ std::optional<TransposeDescription> GetDescriptionForTiledTransposeEmitter(
     return TransposeDescription{&hero, dimensions, permutation,
                                 shmem_usage_bytes};
   }
+  int64_t num_elements_after_transposed_dims = 1;
+  std::pair<int64_t, int64_t> transposed_dims;
   if (permutation.back() == dimensions.size() - 1) {
-    operand_most_minor_dim =
-        hero.operand(0)->shape().dimensions(dimensions.size() - 2);
-    if (bit_width * dimensions.back() <= kMaxBitsInMostMinorDimension &&
-        bit_width * dimensions.back() *
-                std::min(operand_most_minor_dim,
-                         dimensions[dimensions.size() - 2]) >=
-            8 * kMinDimensionToTransposeTiled) {
-      // Tile size for transposition.
-      int64_t shmem_usage_bytes =
-          CeilOfRatio(kNumShmemBanks * (kNumShmemBanks + 1LL) * bit_width *
-                          dimensions.back(),
-                      8LL);
-      return TransposeDescription{&hero, dimensions, permutation,
-                                  shmem_usage_bytes};
+    if (bit_width * dimensions.back() > kMaxBitsInMostMinorDimension) {
+      return std::nullopt;
     }
-  } else if ((operand_most_minor_dim >= kMinDimensionToTransposeTiled &&
-              dimensions.back() >= kMinDimensionToTransposeTiled) ||
-             (operand_most_minor_dim >= kMinDimensionToTransposeTiled2 &&
-              dimensions.back() >= kMinDimensionToTransposeTiled2 &&
-              operand_most_minor_dim * dimensions.back() >=
-                  kMinTotalDimensionsToTransposeTiled)) {
+    num_elements_after_transposed_dims = dimensions.back();
+    transposed_dims = {
+        hero.operand(0)->shape().dimensions(dimensions.size() - 2),
+        dimensions[dimensions.size() - 2]};
+  } else {
     // TODO(b/415741994): TransposeEmitter is regressing for S4 when the last
     // dimension is being transposed. The issue seems to be related to bank
     // conflicts but a proper investigation is needed.
     if (bit_width == 4) {
       return std::nullopt;
     }
+    transposed_dims = {operand_most_minor_dim, dimensions.back()};
+  }
+  if ((std::min(transposed_dims.first, transposed_dims.second) >=
+       kMinDimensionToTransposeTiled) &&
+      (transposed_dims.first * transposed_dims.second >=
+       kMinTotalDimensionsToTransposeTiled)) {
     int64_t shmem_usage_bytes =
-        CeilOfRatio(kNumShmemBanks * (kNumShmemBanks + 1LL) * bit_width, 8LL);
+        CeilOfRatio(kNumShmemBanks * (kNumShmemBanks + 1LL) * bit_width *
+                        num_elements_after_transposed_dims,
+                    8LL);
     return TransposeDescription{&hero, dimensions, permutation,
                                 shmem_usage_bytes};
   }
@@ -977,5 +969,17 @@ ResolveFunctionalDependencyOnInductionVariable(const HloInstruction* instr) {
   return result;
 }
 
+DenseDataIntermediateProto DenseDataIntermediate::ToProto() const {
+  DenseDataIntermediateProto proto;
+  absl::Span<const uint8_t> data = span();
+  proto.mutable_data()->assign(data.begin(), data.end());
+  return proto;
+}
+DenseDataIntermediate DenseDataIntermediate::FromProto(
+    const DenseDataIntermediateProto& proto) {
+  const std::string& data = proto.data();
+  return DenseDataIntermediate::Own(
+      std::vector<uint8_t>(data.begin(), data.end()));
+}
 }  // namespace gpu
 }  // namespace xla
